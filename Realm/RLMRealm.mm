@@ -54,6 +54,13 @@ using util::File;
 @property (nonatomic, copy) RLMNotificationBlock block;
 @end
 
+// Declare the selectors we need on UIApplication to avoid a hard dependency on UIKit
+@interface RLMUIApplication : NSObject
++ (RLMUIApplication *)sharedApplication;
+- (NSUInteger)beginBackgroundTaskWithExpirationHandler:(void(^)())handler;
+- (void)endBackgroundTask:(NSUInteger)identifier;
+@end
+
 @interface RLMRealm ()
 @property (nonatomic, strong) NSHashTable<RLMRealmNotificationToken *> *notificationHandlers;
 - (void)sendNotifications:(RLMNotification)notification;
@@ -120,18 +127,30 @@ NSData *RLMRealmValidatedEncryptionKey(NSData *key) {
 @implementation RLMRealm {
     NSHashTable<RLMFastEnumerator *> *_collectionEnumerators;
     bool _sendingNotifications;
+    NSUInteger _backgroundTaskIdentifier;
 }
 
 + (BOOL)isCoreDebug {
     return realm::Version::has_feature(realm::feature_Debug);
 }
 
+id g_sharedApplication;
 + (void)initialize {
     static bool initialized;
     if (initialized) {
         return;
     }
     initialized = true;
+
+    // Using NSClassFromString rather than directly referencing UIApplication
+    // avoids the need to link UIKit.framework and degrades gracefully on
+    // platforms which do not use UIKit
+    g_sharedApplication = [NSClassFromString(@"UIApplication") sharedApplication];
+
+    // Background tasks aren't supported by UIApplication on all platforms
+    if (![g_sharedApplication respondsToSelector:@selector(beginBackgroundTaskWithExpirationHandler:)]) {
+        g_sharedApplication = nil;
+    }
 
     RLMCheckForUpdates();
     RLMSendAnalytics();
@@ -448,11 +467,27 @@ REALM_NOINLINE void RLMRealmTranslateException(NSError **error) {
     return configuration;
 }
 
+- (void)endBackgroundTask {
+    if (_backgroundTaskIdentifier) {
+        [g_sharedApplication endBackgroundTask:_backgroundTaskIdentifier];
+        _backgroundTaskIdentifier = 0;
+    }
+}
+
 - (void)beginWriteTransaction {
+    // The block needs to not retain `self` or we'll leak any Realms which the
+    // user fails to commit/cancel
+    __unsafe_unretained RLMRealm *unretainedSelf = self;
+    _backgroundTaskIdentifier = [g_sharedApplication beginBackgroundTaskWithExpirationHandler:^{
+        // If we time out just let the OS suspend us rather than terminating
+        [unretainedSelf endBackgroundTask];
+    }];
+
     try {
         _realm->begin_transaction();
     }
     catch (std::exception &ex) {
+        [self endBackgroundTask];
         @throw RLMException(ex);
     }
 }
@@ -464,15 +499,18 @@ REALM_NOINLINE void RLMRealmTranslateException(NSError **error) {
 - (BOOL)commitWriteTransaction:(NSError **)outError {
     try {
         _realm->commit_transaction();
+        [self endBackgroundTask];
         return YES;
     }
     catch (...) {
+        [self endBackgroundTask];
         RLMRealmTranslateException(outError);
         return NO;
     }
 }
 
-- (BOOL)commitWriteTransactionWithoutNotifying:(NSArray<RLMNotificationToken *> *)tokens error:(NSError **)error {
+- (BOOL)commitWriteTransactionWithoutNotifying:(NSArray<RLMNotificationToken *> *)tokens
+                                         error:(NSError **)error {
     for (RLMNotificationToken *token in tokens) {
         if (token.realm != self) {
             @throw RLMException(@"Incorrect Realm: only notifications for the Realm being modified can be skipped.");
@@ -482,9 +520,11 @@ REALM_NOINLINE void RLMRealmTranslateException(NSError **error) {
 
     try {
         _realm->commit_transaction();
+        [self endBackgroundTask];
         return YES;
     }
     catch (...) {
+        [self endBackgroundTask];
         RLMRealmTranslateException(error);
         return NO;
     }
@@ -506,6 +546,7 @@ REALM_NOINLINE void RLMRealmTranslateException(NSError **error) {
 - (void)cancelWriteTransaction {
     try {
         _realm->cancel_transaction();
+        [self endBackgroundTask];
     }
     catch (std::exception &ex) {
         @throw RLMException(ex);
@@ -527,6 +568,7 @@ REALM_NOINLINE void RLMRealmTranslateException(NSError **error) {
     }
 
     _realm->invalidate();
+    [self endBackgroundTask];
 
     for (auto& objectInfo : _info) {
         for (RLMObservationInfo *info : objectInfo.second.observedObjects) {
